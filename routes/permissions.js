@@ -76,4 +76,54 @@ router.get('/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// Updating Permission Status
+router.patch('/:id/status', authMiddleware, async (req, res) => {
+  try {
+    const { status, returnNotes } = req.body;
+    
+    // Validate status
+    if (!['returned', 'approved'].includes(status)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Status must be either "returned" or "approved"' 
+      });
+    }
+
+    const updateData = { status, returnNotes };
+    
+    // If marking as returned, add returnedAt timestamp
+    if (status === 'returned') {
+      updateData.returnedAt = new Date();
+    }
+    
+    const permission = await Permission.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true, runValidators: true } // Add runValidators
+    )
+      .populate('student', 'name student_id class level residence parent_phone')
+      .populate('approvedBy', 'firstName lastName');
+    
+    if (!permission) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Permission not found' 
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      permission,
+      message: `Permission marked as ${status} successfully`
+    });
+    
+  } catch (error) {
+    console.error('Error updating permission status:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message
+    });
+  }
+});
+
 module.exports = router;

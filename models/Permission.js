@@ -39,7 +39,8 @@ const permissionSchema = new mongoose.Schema({
   },
   permissionNumber: {
     type: String,
-    unique: true
+    unique: true,
+    sparse: true
   },
   qrCode: {
     type: String // URL or data for QR code
@@ -50,9 +51,29 @@ const permissionSchema = new mongoose.Schema({
 
 // Generate permission number before save
 permissionSchema.pre('save', async function(next) {
-  if (!this.permissionNumber) {
-    const count = await mongoose.model('Permission').countDocuments();
-    this.permissionNumber = `PERM-${Date.now()}-${count + 1}`;
+  if (!this.permissionNumber || this.permissionNumber === 'null') {
+    try {
+      // Generate more unique number
+      const year = new Date().getFullYear();
+      const month = String(new Date().getMonth() + 1).padStart(2, '0');
+      const day = String(new Date().getDate()).padStart(2, '0');
+      const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+      
+      // Get count for today
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      
+      const dailyCount = await mongoose.model('Permission').countDocuments({
+        createdAt: { $gte: today, $lt: tomorrow }
+      });
+      
+      this.permissionNumber = `PERM-${year}${month}${day}-${String(dailyCount + 1).padStart(3, '0')}-${random}`;
+    } catch (error) {
+      // Ultimate fallback
+      this.permissionNumber = `PERM-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    }
   }
   next();
 });
