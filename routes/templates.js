@@ -1,291 +1,305 @@
-// routes/templates.js
+// routes/templates.js - UPDATED WITH CLOUDINARY
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const Template = require('../models/Template');
-const fs = require('fs');
-const path = require('path');
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const dir = 'uploads/templates/';
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-        // Keep original filename but make it unique
-        const uniqueName = Date.now() + '-' + Math.round(Math.random() * 1E9) + '-' + file.originalname;
-        cb(null, uniqueName);
-    }
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true // Force HTTPS
 });
 
-const upload = multer({ 
-    storage: storage,
-    limits: { fileSize: 10 * 1024 * 1024 }
+// Cloudinary storage for templates
+const templateStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'student-cards/templates',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'pdf', 'svg'],
+    public_id: (req, file) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      return `template-${uniqueSuffix}`;
+    },
+    transformation: [
+      { width: 1200, height: 800, crop: "limit" }, // Optimize for ID cards
+      { quality: "auto:good" } // Auto optimize quality
+    ]
+  }
+});
+
+const upload = multer({
+  storage: templateStorage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB
+    files: 2 // Max 2 files (front & back)
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept only image files
+    const allowedTypes = /jpeg|jpg|png|pdf|svg/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only image files (jpeg, jpg, png, pdf, svg) are allowed!'));
+    }
+  }
 });
 
 // ✅ GET all templates
 router.get('/', async (req, res) => {
-    try {
-        console.log('🔍 Fetching templates from database...');
-        const templates = await Template.find().sort({ isDefault: -1, createdAt: -1 });
-        
-        console.log(`📊 Found ${templates.length} templates:`);
-        templates.forEach(template => {
-            console.log(`   - ${template.name} (ID: ${template._id})`);
-        });
-        
-        res.json({ success: true, templates });
-    } catch (error) {
-        console.error('❌ Error fetching templates:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+  try {
+    console.log('🔍 Fetching templates from database...');
+    const templates = await Template.find().sort({ isDefault: -1, createdAt: -1 });
+    
+    // Generate signed URLs for templates that expire after 1 hour
+    const templatesWithUrls = templates.map(template => ({
+      ...template.toObject(),
+      frontSideUrl: generateSignedUrl(template.frontSide.public_id),
+      backSideUrl: template.backSide ? generateSignedUrl(template.backSide.public_id) : null
+    }));
+    
+    console.log(`📊 Found ${templates.length} templates`);
+    res.json({ success: true, templates: templatesWithUrls });
+  } catch (error) {
+    console.error('❌ Error fetching templates:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// ✅ UPLOAD new template
-// routes/templates.js - FIX UPLOAD ROUTE
+// ✅ UPLOAD new template with Cloudinary
 router.post('/upload', upload.fields([
-    { name: 'frontSide', maxCount: 1 },
-    { name: 'backSide', maxCount: 1 }
+  { name: 'frontSide', maxCount: 1 },
+  { name: 'backSide', maxCount: 1 }
 ]), async (req, res) => {
-    try {
-        const { name, description, setAsDefault } = req.body;
-        
-        console.log('📦 Upload request received');
-        console.log('🖼️ Front side file:', req.files.frontSide[0]);
-        console.log('🖼️ Back side file:', req.files.backSide[0]);
-
-        if (!req.files.frontSide || !req.files.backSide) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Both front and back sides are required' 
-            });
-        }
-
-        // ✅ FIXED: Use the actual saved filename (multer's filename), not originalname
-        const template = new Template({
-            name,
-            description,
-            frontSide: {
-                filename: req.files.frontSide[0].filename, // This is the actual saved filename
-                filepath: req.files.frontSide[0].path,
-                originalname: req.files.frontSide[0].originalname // Keep for reference
-            },
-            backSide: {
-                filename: req.files.backSide[0].filename, // This is the actual saved filename
-                filepath: req.files.backSide[0].path,
-                originalname: req.files.backSide[0].originalname // Keep for reference
-            },
-            isDefault: setAsDefault === 'true'
-        });
-
-        await template.save();
-        console.log('✅ Template saved with correct filenames');
-        console.log('   Front filename:', template.frontSide.filename);
-        console.log('   Back filename:', template.backSide.filename);
-        
-        res.json({ 
-            success: true, 
-            message: 'Template with both sides uploaded successfully', 
-            template 
-        });
-
-    } catch (error) {
-        console.error('❌ Upload error:', error);
-        if (req.files) {
-            Object.values(req.files).forEach(files => {
-                files.forEach(file => {
-                    if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-                });
-            });
-        }
-        res.status(500).json({ success: false, error: error.message });
+  try {
+    const { name, description, setAsDefault } = req.body;
+    
+    console.log('📦 Upload request received');
+    
+    if (!req.files.frontSide || !req.files.backSide) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Both front and back sides are required' 
+      });
     }
+
+    // Cloudinary returns file info in req.files
+    const frontFile = req.files.frontSide[0];
+    const backFile = req.files.backSide[0];
+
+    // Create template with Cloudinary URLs and public_ids
+    const template = new Template({
+      name,
+      description,
+      frontSide: {
+        url: frontFile.path, // Cloudinary URL
+        secure_url: frontFile.path, // HTTPS URL
+        public_id: frontFile.filename, // Cloudinary public_id
+        originalname: frontFile.originalname,
+        format: frontFile.format,
+        width: frontFile.width,
+        height: frontFile.height,
+        bytes: frontFile.size,
+        resource_type: frontFile.resource_type
+      },
+      backSide: {
+        url: backFile.path,
+        secure_url: backFile.path,
+        public_id: backFile.filename,
+        originalname: backFile.originalname,
+        format: backFile.format,
+        width: backFile.width,
+        height: backFile.height,
+        bytes: backFile.size,
+        resource_type: backFile.resource_type
+      },
+      isDefault: setAsDefault === 'true'
+    });
+
+    // If set as default, unset other defaults
+    if (template.isDefault) {
+      await Template.updateMany(
+        { _id: { $ne: template._id } },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    await template.save();
+    console.log('✅ Template saved to Cloudinary');
+    console.log('   Front URL:', template.frontSide.secure_url);
+    console.log('   Back URL:', template.backSide.secure_url);
+    
+    res.json({ 
+      success: true, 
+      message: 'Template uploaded to cloud successfully', 
+      template 
+    });
+
+  } catch (error) {
+    console.error('❌ Upload error:', error);
+    
+    // If files were uploaded but DB save failed, delete from Cloudinary
+    if (req.files && req.files.frontSide) {
+      try {
+        await cloudinary.uploader.destroy(req.files.frontSide[0].filename);
+        await cloudinary.uploader.destroy(req.files.backSide[0].filename);
+      } catch (cleanupError) {
+        console.warn('⚠️ Could not delete uploaded files:', cleanupError.message);
+      }
+    }
+    
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // ✅ SET default template
 router.patch('/:id/set-default', async (req, res) => {
-    try {
-        // Unset all defaults
-        await Template.updateMany({ isDefault: true }, { $set: { isDefault: false } });
-        
-        // Set new default
-        const template = await Template.findByIdAndUpdate(
-            req.params.id,
-            { isDefault: true },
-            { new: true }
-        );
+  try {
+    // Unset all defaults
+    await Template.updateMany({ isDefault: true }, { $set: { isDefault: false } });
+    
+    // Set new default
+    const template = await Template.findByIdAndUpdate(
+      req.params.id,
+      { isDefault: true },
+      { new: true }
+    );
 
-        res.json({ success: true, message: 'Default template updated', template });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    res.json({ success: true, message: 'Default template updated', template });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-
-// ✅ UPDATED: Delete Template with file cleanup
+// ✅ DELETE Template with Cloudinary cleanup
 router.delete('/:id', async (req, res) => {
-    try {
-        const template = await Template.findById(req.params.id);
-        if (!template) {
-            return res.status(404).json({ success: false, error: 'Template not found' });
-        }
-
-        console.log('🗑️ Deleting template:', template.name);
-
-        // ✅ DELETE ALL ASSOCIATED FILES
-        const filesToDelete = [];
-
-        // Front side file
-        if (template.frontSide && template.frontSide.filepath) {
-            filesToDelete.push(template.frontSide.filepath);
-        }
-
-        // Back side file  
-        if (template.backSide && template.backSide.filepath) {
-            filesToDelete.push(template.backSide.filepath);
-        }
-
-        // Original uploaded file (if exists in your schema)
-        if (template.filepath) {
-            filesToDelete.push(template.filepath);
-        }
-
-        // Delete all files
-        let deletedFiles = 0;
-        for (const filePath of filesToDelete) {
-            try {
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
-                    deletedFiles++;
-                    console.log('✅ Deleted file:', filePath);
-                }
-            } catch (fileError) {
-                console.warn('⚠️ Could not delete file:', filePath, fileError.message);
-            }
-        }
-
-        // Delete from database
-        await Template.findByIdAndDelete(req.params.id);
-
-        res.json({ 
-            success: true, 
-            message: `Template deleted successfully`,
-            deletedFiles: deletedFiles
-        });
-
-    } catch (error) {
-        console.error('❌ Template deletion error:', error);
-        res.status(500).json({ success: false, error: error.message });
+  try {
+    const template = await Template.findById(req.params.id);
+    if (!template) {
+      return res.status(404).json({ success: false, error: 'Template not found' });
     }
+
+    console.log('🗑️ Deleting template:', template.name);
+
+    // Delete files from Cloudinary
+    let deletedFiles = 0;
+    const deletePromises = [];
+
+    // Delete front side
+    if (template.frontSide && template.frontSide.public_id) {
+      deletePromises.push(
+        cloudinary.uploader.destroy(template.frontSide.public_id)
+          .then(result => {
+            if (result.result === 'ok') deletedFiles++;
+            console.log('✅ Deleted from Cloudinary:', template.frontSide.public_id);
+          })
+          .catch(err => console.warn('⚠️ Could not delete from Cloudinary:', err.message))
+      );
+    }
+
+    // Delete back side
+    if (template.backSide && template.backSide.public_id) {
+      deletePromises.push(
+        cloudinary.uploader.destroy(template.backSide.public_id)
+          .then(result => {
+            if (result.result === 'ok') deletedFiles++;
+            console.log('✅ Deleted from Cloudinary:', template.backSide.public_id);
+          })
+          .catch(err => console.warn('⚠️ Could not delete from Cloudinary:', err.message))
+      );
+    }
+
+    // Wait for all deletions
+    await Promise.allSettled(deletePromises);
+
+    // Delete from database
+    await Template.findByIdAndDelete(req.params.id);
+
+    res.json({ 
+      success: true, 
+      message: `Template deleted successfully from cloud and database`,
+      deletedFiles: deletedFiles
+    });
+
+  } catch (error) {
+    console.error('❌ Template deletion error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// In your template routes file (e.g., templates.js)
-router.post('/cleanup-orphaned-files', async (req, res) => {
-    try {
-        console.log('🧹 Cleaning up orphaned template files...');
-        
-        const templates = await Template.find();
-        
-        // Get all valid file paths from database
-        const validTemplateFiles = [];
-        
-        templates.forEach(template => {
-            if (template.frontSide?.filepath) validTemplateFiles.push(template.frontSide.filepath);
-            if (template.backSide?.filepath) validTemplateFiles.push(template.backSide.filepath);
-            if (template.filepath) validTemplateFiles.push(template.filepath);
-        });
-        
-        // Scan template upload directory
-        const templateDir = 'uploads/templates';
-        let orphanedFiles = 0;
-        
-        if (fs.existsSync(templateDir)) {
-            const files = fs.readdirSync(templateDir, { withFileTypes: true })
-                .filter(dirent => dirent.isFile())
-                .map(dirent => path.join(templateDir, dirent.name));
-            
-            for (const filePath of files) {
-                if (!validTemplateFiles.includes(filePath)) {
-                    try {
-                        fs.unlinkSync(filePath);
-                        orphanedFiles++;
-                        console.log('🗑️ Deleted orphaned template file:', filePath);
-                    } catch (error) {
-                        console.warn('⚠️ Could not delete orphaned file:', filePath);
-                    }
-                }
-            }
-        }
-        
-        res.json({
-            success: true,
-            message: `Template cleanup completed`,
-            orphanedFilesDeleted: orphanedFiles
-        });
-        
-    } catch (error) {
-        console.error('❌ Template cleanup error:', error);
-        res.status(500).json({ success: false, error: error.message });
-    }
+// ✅ PREVIEW template image (redirects to Cloudinary URL)
+router.get('/preview/:publicId', async (req, res) => {
+  try {
+    const { publicId } = req.params;
+    
+    // Generate optimized URL with transformations
+    const url = cloudinary.url(publicId, {
+      fetch_format: 'auto',
+      quality: 'auto',
+      width: 800,
+      height: 600,
+      crop: 'limit'
+    });
+    
+    // Redirect to Cloudinary URL
+    res.redirect(url);
+    
+  } catch (error) {
+    console.error('❌ Preview error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-
-// Add this route to serve template preview images
-router.get('/preview/:filename', (req, res) => {
-    try {
-        const filename = req.params.filename;
-        const uploadsDir = path.join(__dirname, '../uploads/templates');
-        const filePath = path.join(uploadsDir, filename);
-        
-        console.log('🔍 Looking for file:', filePath);
-        
-        if (!fs.existsSync(filePath)) {
-            console.log('❌ Files not found:', filePath);
-            return res.status(404).json({ error: 'File not found' });
-        }
-
-        // Set appropriate content type
-        const ext = path.extname(filename).toLowerCase();
-        const contentTypes = {
-            '.png': 'image/png',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg'
-        };
-        
-        res.setHeader('Content-Type', contentTypes[ext] || 'image/png');
-        res.sendFile(path.resolve(filePath));
-        
-    } catch (error) {
-        console.error('❌ Preview error:', error);
-        res.status(500).json({ error: error.message });
+// ✅ GET direct template URL with optimizations
+router.get('/url/:templateId/:side', async (req, res) => {
+  try {
+    const { templateId, side } = req.params;
+    const template = await Template.findById(templateId);
+    
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
     }
+
+    const sideData = side === 'front' ? template.frontSide : template.backSide;
+    if (!sideData || !sideData.public_id) {
+      return res.status(404).json({ error: 'Template side not found' });
+    }
+
+    // Generate optimized URL with transformations
+    const url = cloudinary.url(sideData.public_id, {
+      fetch_format: 'auto',
+      quality: 'auto',
+      width: 1200,
+      crop: 'limit',
+      secure: true
+    });
+
+    res.json({ 
+      success: true, 
+      url: url,
+      public_id: sideData.public_id 
+    });
+
+  } catch (error) {
+    console.error('❌ URL generation error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-
-// routes/templates.js - ADD DEBUG ROUTE
-router.get('/debug-files', (req, res) => {
-    try {
-        const uploadsDir = path.join(__dirname, '../uploads/templates');
-        console.log('📁 Checking uploads directory:', uploadsDir);
-        
-        if (!fs.existsSync(uploadsDir)) {
-            return res.json({ error: 'Uploads directory does not exist', path: uploadsDir });
-        }
-        
-        const files = fs.readdirSync(uploadsDir);
-        console.log('📄 Files found:', files);
-        
-        res.json({
-            uploadsDir,
-            fileCount: files.length,
-            files: files
-        });
-    } catch (error) {
-        res.json({ error: error.message });
-    }
-});
+// Helper function to generate signed URLs
+function generateSignedUrl(public_id, expiresIn = 3600) {
+  if (!public_id) return null;
+  
+  return cloudinary.url(public_id, {
+    sign_url: true,
+    expires_at: Math.floor(Date.now() / 1000) + expiresIn
+  });
+}
 
 module.exports = router;

@@ -35,8 +35,14 @@ const studentSchema = new mongoose.Schema({
         type: String,
         default: ''
     },
-    photo_path: {
-        type: String
+    // Cloudinary fields
+    photo_url: { type: String }, // Cloudinary URL
+    photo_public_id: { type: String }, // Cloudinary public_id for management
+    photo_metadata: {
+        width: Number,
+        height: Number,
+        format: String,
+        bytes: Number
     },
     has_photo: {
         type: Boolean,
