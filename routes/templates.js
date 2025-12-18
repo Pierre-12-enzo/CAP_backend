@@ -1,5 +1,6 @@
 // routes/templates.js - UPDATED WITH CLOUDINARY
 const express = require('express');
+const path = require('path');
 const router = express.Router();
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
@@ -42,7 +43,7 @@ const upload = multer({
     const allowedTypes = /jpeg|jpg|png|pdf|svg/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
     const mimetype = allowedTypes.test(file.mimetype);
-    
+
     if (mimetype && extname) {
       return cb(null, true);
     } else {
@@ -51,28 +52,55 @@ const upload = multer({
   }
 });
 
-// ✅ GET all templates
+// ✅ GET all templates - SIMPLE WORKING VERSION
 router.get('/', async (req, res) => {
   try {
-    console.log('🔍 Fetching templates from database...');
+    console.log('🔍 Fetching templates...');
     const templates = await Template.find().sort({ isDefault: -1, createdAt: -1 });
     
-    // Generate signed URLs for templates that expire after 1 hour
-    const templatesWithUrls = templates.map(template => ({
-      ...template.toObject(),
-      frontSideUrl: generateSignedUrl(template.frontSide.public_id),
-      backSideUrl: template.backSide ? generateSignedUrl(template.backSide.public_id) : null
-    }));
+    // Generate Cloudinary preview URLs
+    const templatesWithUrls = templates.map(template => {
+      const templateObj = template.toObject();
+      
+      // Generate preview URLs
+      let frontSideUrl = null;
+      let backSideUrl = null;
+      
+      if (templateObj.frontSide?.public_id) {
+        frontSideUrl = cloudinary.url(templateObj.frontSide.public_id, {
+          width: 400,
+          height: 300,
+          crop: 'fill',
+          quality: 'auto'
+        });
+      }
+      
+      if (templateObj.backSide?.public_id) {
+        backSideUrl = cloudinary.url(templateObj.backSide.public_id, {
+          width: 400,
+          height: 300,
+          crop: 'fill',
+          quality: 'auto'
+        });
+      }
+      
+      return {
+        ...templateObj,
+        frontSideUrl,
+        backSideUrl
+      };
+    });
     
     console.log(`📊 Found ${templates.length} templates`);
     res.json({ success: true, templates: templatesWithUrls });
+    
   } catch (error) {
     console.error('❌ Error fetching templates:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ✅ UPLOAD new template with Cloudinary
+// ✅ UPLOAD new template with Cloudinary - SIMPLE WORKING VERSION
 router.post('/upload', upload.fields([
   { name: 'frontSide', maxCount: 1 },
   { name: 'backSide', maxCount: 1 }
@@ -80,81 +108,74 @@ router.post('/upload', upload.fields([
   try {
     const { name, description, setAsDefault } = req.body;
     
-    console.log('📦 Upload request received');
+    console.log('📦 Uploading template:', name);
     
-    if (!req.files.frontSide || !req.files.backSide) {
+    if (!req.files || !req.files.frontSide || !req.files.backSide) {
       return res.status(400).json({ 
         success: false, 
         error: 'Both front and back sides are required' 
       });
     }
 
-    // Cloudinary returns file info in req.files
     const frontFile = req.files.frontSide[0];
     const backFile = req.files.backSide[0];
 
-    // Create template with Cloudinary URLs and public_ids
+    // Create SIMPLE template - only what we need
     const template = new Template({
       name,
       description,
       frontSide: {
-        url: frontFile.path, // Cloudinary URL
-        secure_url: frontFile.path, // HTTPS URL
-        public_id: frontFile.filename, // Cloudinary public_id
-        originalname: frontFile.originalname,
-        format: frontFile.format,
-        width: frontFile.width,
-        height: frontFile.height,
-        bytes: frontFile.size,
-        resource_type: frontFile.resource_type
+        filename: frontFile.originalname, // '2.png'
+        filepath: frontFile.path, // Cloudinary URL
+        url: frontFile.path,
+        secure_url: frontFile.path,
+        public_id: frontFile.filename // 'student-cards/templates/template-...'
       },
       backSide: {
+        filename: backFile.originalname, // '1.png'
+        filepath: backFile.path, // Cloudinary URL
         url: backFile.path,
         secure_url: backFile.path,
-        public_id: backFile.filename,
-        originalname: backFile.originalname,
-        format: backFile.format,
-        width: backFile.width,
-        height: backFile.height,
-        bytes: backFile.size,
-        resource_type: backFile.resource_type
+        public_id: backFile.filename
       },
       isDefault: setAsDefault === 'true'
     });
 
+    console.log('💾 Saving template to DB...');
+
     // If set as default, unset other defaults
     if (template.isDefault) {
-      await Template.updateMany(
-        { _id: { $ne: template._id } },
-        { $set: { isDefault: false } }
-      );
+      await Template.updateMany({}, { $set: { isDefault: false } });
     }
 
     await template.save();
-    console.log('✅ Template saved to Cloudinary');
-    console.log('   Front URL:', template.frontSide.secure_url);
-    console.log('   Back URL:', template.backSide.secure_url);
+    
+    console.log('✅ Template saved successfully!');
+    console.log('   ID:', template._id);
+    console.log('   Front public_id:', template.frontSide.public_id);
+    console.log('   Back public_id:', template.backSide.public_id);
     
     res.json({ 
       success: true, 
-      message: 'Template uploaded to cloud successfully', 
+      message: 'Template uploaded successfully!', 
       template 
     });
 
   } catch (error) {
-    console.error('❌ Upload error:', error);
+    console.error('❌ Upload error:', error.message);
     
-    // If files were uploaded but DB save failed, delete from Cloudinary
-    if (req.files && req.files.frontSide) {
+    // Try to delete from Cloudinary if DB save failed
+    if (req.files?.frontSide?.[0]?.filename) {
       try {
         await cloudinary.uploader.destroy(req.files.frontSide[0].filename);
         await cloudinary.uploader.destroy(req.files.backSide[0].filename);
-      } catch (cleanupError) {
-        console.warn('⚠️ Could not delete uploaded files:', cleanupError.message);
-      }
+      } catch (e) {}
     }
     
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ 
+      success: false, 
+      error: 'Upload failed: ' + error.message 
+    });
   }
 });
 
@@ -163,7 +184,7 @@ router.patch('/:id/set-default', async (req, res) => {
   try {
     // Unset all defaults
     await Template.updateMany({ isDefault: true }, { $set: { isDefault: false } });
-    
+
     // Set new default
     const template = await Template.findByIdAndUpdate(
       req.params.id,
@@ -221,8 +242,8 @@ router.delete('/:id', async (req, res) => {
     // Delete from database
     await Template.findByIdAndDelete(req.params.id);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `Template deleted successfully from cloud and database`,
       deletedFiles: deletedFiles
     });
@@ -233,13 +254,49 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// ✅ PREVIEW template image (redirects to Cloudinary URL)
-router.get('/preview/:publicId', async (req, res) => {
+// ✅ PREVIEW template image - SIMPLE WORKING VERSION
+router.get('/preview/:id', async (req, res) => {
   try {
-    const { publicId } = req.params;
+    const { id } = req.params;
     
-    // Generate optimized URL with transformations
-    const url = cloudinary.url(publicId, {
+    console.log('🖼️ Preview requested for:', id);
+    
+    // Method 1: Try to find by filename (like '2.png')
+    let template = await Template.findOne({
+      $or: [
+        { 'frontSide.filename': id },
+        { 'backSide.filename': id }
+      ]
+    });
+    
+    let cloudinaryPublicId = null;
+    
+    if (template) {
+      console.log(`✅ Found template by filename: ${template.name}`);
+      if (template.frontSide.filename === id) {
+        cloudinaryPublicId = template.frontSide.public_id;
+      } else if (template.backSide.filename === id) {
+        cloudinaryPublicId = template.backSide.public_id;
+      }
+    } 
+    // Method 2: Try to find by template ID
+    else {
+      try {
+        template = await Template.findById(id);
+        if (template) {
+          console.log(`✅ Found template by ID: ${template.name}`);
+          cloudinaryPublicId = template.frontSide.public_id;
+        }
+      } catch (err) {}
+    }
+    
+    if (!cloudinaryPublicId) {
+      console.log('❌ No template found, using id as public_id');
+      cloudinaryPublicId = id;
+    }
+    
+    // Generate Cloudinary URL
+    const url = cloudinary.url(cloudinaryPublicId, {
       fetch_format: 'auto',
       quality: 'auto',
       width: 800,
@@ -247,7 +304,7 @@ router.get('/preview/:publicId', async (req, res) => {
       crop: 'limit'
     });
     
-    // Redirect to Cloudinary URL
+    console.log(`🔗 Redirecting to: ${url}`);
     res.redirect(url);
     
   } catch (error) {
@@ -261,7 +318,7 @@ router.get('/url/:templateId/:side', async (req, res) => {
   try {
     const { templateId, side } = req.params;
     const template = await Template.findById(templateId);
-    
+
     if (!template) {
       return res.status(404).json({ error: 'Template not found' });
     }
@@ -280,10 +337,10 @@ router.get('/url/:templateId/:side', async (req, res) => {
       secure: true
     });
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       url: url,
-      public_id: sideData.public_id 
+      public_id: sideData.public_id
     });
 
   } catch (error) {
@@ -295,7 +352,7 @@ router.get('/url/:templateId/:side', async (req, res) => {
 // Helper function to generate signed URLs
 function generateSignedUrl(public_id, expiresIn = 3600) {
   if (!public_id) return null;
-  
+
   return cloudinary.url(public_id, {
     sign_url: true,
     expires_at: Math.floor(Date.now() / 1000) + expiresIn

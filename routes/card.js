@@ -1,205 +1,49 @@
-// routes/card.js - UPDATED FOR CLOUDINARY
+// routes/card.js - COMPLETE APPROACH A (All-in-one with Cloudinary)
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { createCanvas, loadImage, registerFont } = require('canvas');
 const fs = require('fs');
 const path = require('path');
-const csv = require('csv-parser');
+const JSZip = require('jszip'); // For ZIP extraction
 const archiver = require('archiver');
 const stream = require('stream');
-const axios = require('axios'); // Add this for fetching Cloudinary images
+const cloudinary = require('cloudinary').v2;
 const Student = require('../models/Student');
 const Template = require('../models/Template');
 
-// Multer configuration for CSV/ZIP only (photos go to Cloudinary via student.js)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    if (file.fieldname === 'csv') {
-      cb(null, 'uploads/csv/');
-    } else if (file.fieldname === 'photoZip') {
-      cb(null, 'uploads/zips/');
-    } else {
-      cb(null, 'uploads/temp/');
-    }
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
-  }
+// Configure Cloudinary (use same config as templates.js)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true
 });
 
+// Multer memory storage (NO DISK STORAGE)
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  storage: multer.memoryStorage(),
+  limits: { 
+    fileSize: 100 * 1024 * 1024 // 100MB for large ZIP files
+  }
 });
 
 // Register fonts
 try {
   registerFont(path.join(__dirname, '../fonts/Roboto-Bold.ttf'), { family: 'Roboto', weight: 'bold' });
   registerFont(path.join(__dirname, '../fonts/Roboto-Regular.ttf'), { family: 'Roboto' });
-  registerFont(path.join(__dirname, '../fonts/OpenSans-Regular.ttf'), { family: 'Open Sans' });
-  console.log('✅ Fonts registered successfully');
+  console.log('✅ Fonts registered');
 } catch (error) {
-  console.log('⚠️ Using system fonts (custom fonts not found)');
+  console.log('⚠️ Using system fonts');
 }
 
-// ✅ BATCH PROCESSING - WITH CLOUDINARY TEMPLATES
-router.post('/process-csv-generate', upload.fields([
-  { name: 'csv', maxCount: 1 },
-  { name: 'photoZip', maxCount: 1 }
-]), async (req, res) => {
-  try {
-    console.log('🚀 Starting batch card generation with Cloudinary...');
 
-    if (!req.files.csv) {
-      return res.status(400).json({
-        success: false,
-        error: 'CSV file is required'
-      });
-    }
-
-    if (!req.body.templateId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Template ID is required'
-      });
-    }
-
-    // Get template from database (now contains Cloudinary URLs)
-    const template = await Template.findById(req.body.templateId);
-    if (!template) {
-      return res.status(404).json({
-        success: false,
-        error: 'Template not found'
-      });
-    }
-
-    console.log(`📊 Using template: ${template.name} from Cloudinary`);
-
-    // Step 1: Parse CSV
-    const students = await parseCSV(req.files.csv[0].path);
-    console.log(`📊 Parsed ${students.length} students from CSV`);
-
-    // Step 2: Process photos if provided (temporary local processing)
-    let photoMap = {};
-    if (req.files.photoZip) {
-      photoMap = await extractPhotos(req.files.photoZip[0].path);
-      console.log(`🖼️ Extracted ${Object.keys(photoMap).length} photos`);
-    }
-
-    // Step 3: Save/update students in database
-    const savedStudents = [];
-    for (const studentData of students) {
-      try {
-        const existingStudent = await Student.findOne({ student_id: studentData.student_id });
-        
-        if (existingStudent) {
-          // Update existing student
-          Object.assign(existingStudent, studentData);
-          
-          // Update photo if provided in ZIP
-          if (photoMap[studentData.student_id]) {
-            existingStudent.temp_photo_path = photoMap[studentData.student_id]; // Temporary path
-          }
-          
-          await existingStudent.save();
-          savedStudents.push(existingStudent);
-        } else {
-          // Create new student (photos will be uploaded to Cloudinary via separate route)
-          const student = new Student({
-            ...studentData,
-            temp_photo_path: photoMap[studentData.student_id] || null
-          });
-          await student.save();
-          savedStudents.push(student);
-        }
-      } catch (error) {
-        console.error(`❌ Failed to save student ${studentData.student_id}:`, error);
-      }
-    }
-
-    console.log(`✅ Processed ${savedStudents.length} students`);
-
-    // ✅ STREAM CARDS DIRECTLY TO ZIP RESPONSE
-    res.set({
-      'Content-Type': 'application/zip',
-      'Content-Disposition': `attachment; filename="batch-id-cards-${Date.now()}.zip"`
-    });
-
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.pipe(res);
-
-    const coordinates = JSON.parse(req.body.coordinates || '{}');
-    let generatedCount = 0;
-
-    console.log('🎨 Generating cards from Cloudinary templates...');
-
-    // Generate and stream each card
-    for (const student of savedStudents) {
-      try {
-        // Use temporary photo path or existing Cloudinary photo
-        const studentPhotoPath = student.temp_photo_path || 
-                               (student.photo_url ? student.photo_url : null);
-        
-        const { frontBuffer, backBuffer } = await generateCardsWithCloudinary(
-          student, 
-          template, 
-          coordinates, 
-          studentPhotoPath
-        );
-
-        // Add to ZIP stream
-        archive.append(frontBuffer, { name: `${student.student_id}/front-side.png` });
-        archive.append(backBuffer, { name: `${student.student_id}/back-side.png` });
-
-        // Update tracking
-        student.card_generated = true;
-        student.card_generation_count = (student.card_generation_count || 0) + 1;
-        student.last_card_generated = new Date();
-        if (!student.first_card_generated) {
-          student.first_card_generated = new Date();
-        }
-        
-        // Clean temp photo path
-        if (student.temp_photo_path) {
-          delete student.temp_photo_path;
-        }
-        
-        await student.save();
-
-        generatedCount++;
-        console.log(`✅ Generated card ${generatedCount}/${savedStudents.length}: ${student.name}`);
-
-      } catch (error) {
-        console.error(`❌ Card generation failed for ${student.name}:`, error);
-      }
-    }
-
-    // Finalize ZIP
-    archive.finalize();
-    console.log(`📥 Streaming ${generatedCount} cards to user's download`);
-
-    // Cleanup temporary files
-    cleanupFiles([req.files.csv[0].path]);
-    if (req.files.photoZip) {
-      cleanupFiles([req.files.photoZip[0].path]);
-    }
-
-  } catch (error) {
-    console.error('❌ Batch processing error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ✅ SINGLE CARD GENERATION - WITH CLOUDINARY
+// ✅ 1. SINGLE CARD GENERATION
 router.post('/generate-single-card', async (req, res) => {
   try {
     const { studentId, coordinates, templateId } = req.body;
 
-    console.log('🎯 Starting single card generation with Cloudinary...');
+    console.log('🎯 Starting single card generation...');
 
     // Input validation
     if (!studentId || !templateId) {
@@ -226,15 +70,15 @@ router.post('/generate-single-card', async (req, res) => {
 
     console.log(`🖼️ Generating card for: ${student.name}`);
 
-    // Use student's Cloudinary photo or no photo
-    const studentPhotoPath = student.photo_url;
+    // Use student's Cloudinary photo
+    const studentPhotoUrl = student.photo_url;
 
-    // ✅ GENERATE WITH CLOUDINARY TEMPLATES
+    // Generate card
     const { frontBuffer, backBuffer } = await generateCardsWithCloudinary(
       student,
       template,
       parsedCoordinates,
-      studentPhotoPath
+      studentPhotoUrl
     );
 
     // Create ZIP
@@ -268,7 +112,190 @@ router.post('/generate-single-card', async (req, res) => {
   }
 });
 
-// ✅ CARD HISTORY (unchanged)
+// ✅ 2. BATCH PROCESSING - COMPLETE APPROACH A
+router.post('/process-csv-generate', upload.fields([
+  { name: 'csv', maxCount: 1 },
+  { name: 'photoZip', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    console.log('🚀 Starting Approach A - All-in-one batch processing with Cloudinary...');
+
+    // ==================== VALIDATION ====================
+    if (!req.files || !req.files.csv) {
+      return res.status(400).json({
+        success: false,
+        error: 'CSV file is required'
+      });
+    }
+
+    if (!req.body.templateId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Template ID is required'
+      });
+    }
+
+    console.log('📁 Files received:', {
+      csvSize: `${(req.files.csv[0].size / 1024).toFixed(2)} KB`,
+      hasPhotoZip: !!req.files.photoZip,
+      templateId: req.body.templateId
+    });
+
+    // ==================== PARSE CSV ====================
+    console.log('📊 Parsing CSV from buffer...');
+    const students = await parseCSVFromBuffer(req.files.csv[0].buffer);
+    console.log(`✅ Parsed ${students.length} students from CSV`);
+
+    // ==================== EXTRACT & UPLOAD PHOTOS TO CLOUDINARY ====================
+    let photoCloudinaryMap = {}; // student_id -> { url, public_id, metadata }
+    
+    if (req.files.photoZip && req.files.photoZip[0]) {
+      console.log('📦 Extracting photos from ZIP and uploading to Cloudinary...');
+      photoCloudinaryMap = await extractAndUploadPhotosToCloudinary(req.files.photoZip[0].buffer);
+      console.log(`✅ Uploaded ${Object.keys(photoCloudinaryMap).length} photos to Cloudinary`);
+    }
+
+    // ==================== SAVE STUDENTS WITH CLOUDINARY DATA ====================
+    console.log('💾 Saving/updating students in database...');
+    const savedStudents = [];
+    
+    for (const studentData of students) {
+      try {
+        const existingStudent = await Student.findOne({ student_id: studentData.student_id });
+        const cloudinaryPhoto = photoCloudinaryMap[studentData.student_id];
+        
+        if (existingStudent) {
+          // Update existing student
+          Object.assign(existingStudent, studentData);
+          
+          // Update Cloudinary photo if available
+          if (cloudinaryPhoto) {
+            existingStudent.photo_url = cloudinaryPhoto.secure_url;
+            existingStudent.photo_public_id = cloudinaryPhoto.public_id;
+            existingStudent.photo_metadata = {
+              width: cloudinaryPhoto.width,
+              height: cloudinaryPhoto.height,
+              format: cloudinaryPhoto.format,
+              bytes: cloudinaryPhoto.bytes
+            };
+            existingStudent.has_photo = true;
+            existingStudent.photo_uploaded_at = new Date();
+          }
+          
+          await existingStudent.save();
+          savedStudents.push(existingStudent);
+          
+          console.log(`✅ Updated student: ${studentData.name} ${cloudinaryPhoto ? '(+photo)' : ''}`);
+        } else {
+          // Create new student with Cloudinary data
+          const student = new Student({
+            ...studentData,
+            photo_url: cloudinaryPhoto ? cloudinaryPhoto.secure_url : null,
+            photo_public_id: cloudinaryPhoto ? cloudinaryPhoto.public_id : null,
+            photo_metadata: cloudinaryPhoto ? {
+              width: cloudinaryPhoto.width,
+              height: cloudinaryPhoto.height,
+              format: cloudinaryPhoto.format,
+              bytes: cloudinaryPhoto.bytes
+            } : null,
+            has_photo: !!cloudinaryPhoto,
+            photo_uploaded_at: cloudinaryPhoto ? new Date() : null
+          });
+          
+          await student.save();
+          savedStudents.push(student);
+          
+          console.log(`✅ Created student: ${studentData.name} ${cloudinaryPhoto ? '(+photo)' : ''}`);
+        }
+      } catch (error) {
+        console.error(`❌ Failed to save student ${studentData.student_id}:`, error.message);
+      }
+    }
+
+    console.log(`✅ Total students saved: ${savedStudents.length}`);
+
+    // ==================== GET TEMPLATE ====================
+    const template = await Template.findById(req.body.templateId);
+    if (!template) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+
+    console.log(`🎨 Using template: ${template.name}`);
+
+    // ==================== PARSE COORDINATES ====================
+    const coordinates = req.body.coordinates ? JSON.parse(req.body.coordinates) : {};
+
+    // ==================== GENERATE CARDS ====================
+    console.log('🎨 Generating ID cards...');
+    
+    // Set response headers for ZIP stream
+    res.set({
+      'Content-Type': 'application/zip',
+      'Content-Disposition': `attachment; filename="batch-id-cards-${Date.now()}.zip"`
+    });
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.pipe(res);
+
+    let generatedCount = 0;
+    const totalStudents = savedStudents.length;
+
+    // Generate and stream each card
+    for (const student of savedStudents) {
+      try {
+        console.log(`🔄 Generating card ${generatedCount + 1}/${totalStudents}: ${student.name}`);
+        
+        // Use student's Cloudinary photo URL
+        const studentPhotoUrl = student.photo_url;
+        
+        const { frontBuffer, backBuffer } = await generateCardsWithCloudinary(
+          student, 
+          template, 
+          coordinates, 
+          studentPhotoUrl // Pass Cloudinary URL
+        );
+
+        // Add to ZIP stream
+        archive.append(frontBuffer, { name: `${student.student_id}/front-side.png` });
+        archive.append(backBuffer, { name: `${student.student_id}/back-side.png` });
+
+        // Update student card generation stats
+        student.card_generated = true;
+        student.card_generation_count = (student.card_generation_count || 0) + 1;
+        student.last_card_generated = new Date();
+        if (!student.first_card_generated) {
+          student.first_card_generated = new Date();
+        }
+        
+        await student.save();
+
+        generatedCount++;
+        console.log(`✅ Generated card for ${student.name}`);
+
+      } catch (error) {
+        console.error(`❌ Card generation failed for ${student.name}:`, error.message);
+      }
+    }
+
+    // Finalize ZIP
+    archive.finalize();
+    console.log(`📥 Streaming ${generatedCount} cards to download`);
+    console.log('✅ Approach A - Batch processing completed successfully!');
+
+  } catch (error) {
+    console.error('❌ Batch processing error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// ✅ 3. CARD HISTORY
 router.get('/history', async (req, res) => {
   try {
     console.log('📊 Getting card history...');
@@ -316,7 +343,7 @@ router.get('/history', async (req, res) => {
   }
 });
 
-// ✅ GET STUDENT CARD HISTORY (unchanged)
+// ✅ 4. GET STUDENT CARD HISTORY
 router.get('/history/student/:studentId', async (req, res) => {
   try {
     const { studentId } = req.params;
@@ -355,7 +382,7 @@ router.get('/history/student/:studentId', async (req, res) => {
   }
 });
 
-// ✅ GET ALL STUDENTS FOR DROPDOWN
+// ✅ 6. GET ALL STUDENTS FOR DROPDOWN
 router.get('/students', async (req, res) => {
   try {
     const students = await Student.find().sort({ name: 1 });
@@ -369,10 +396,7 @@ router.get('/students', async (req, res) => {
   }
 });
 
-// ✅ STUDENT PHOTO UPLOAD (Now handled by student.js with Cloudinary)
-// Remove this route since it's handled by student.js
-
-// ✅ GET STUDENT PHOTO FROM CLOUDINARY
+// ✅ 7. GET STUDENT PHOTO FROM CLOUDINARY
 router.get('/student-photo/:studentId', async (req, res) => {
   try {
     const { studentId } = req.params;
@@ -391,7 +415,7 @@ router.get('/student-photo/:studentId', async (req, res) => {
   }
 });
 
-// ✅ GET TEMPLATE DIMENSIONS FROM CLOUDINARY
+// ✅ 8. GET TEMPLATE DIMENSIONS FROM CLOUDINARY
 router.get('/template-dimensions/:templateId', async (req, res) => {
   try {
     const { templateId } = req.params;
@@ -405,7 +429,7 @@ router.get('/template-dimensions/:templateId', async (req, res) => {
     }
 
     // Load image from Cloudinary URL to get dimensions
-    const templateImage = await loadImage(template.frontSide.secure_url);
+    const templateImage = await loadImage(template.frontSide.secure_url || template.frontSide.url);
     const dimensions = {
       width: templateImage.width,
       height: templateImage.height
@@ -419,7 +443,7 @@ router.get('/template-dimensions/:templateId', async (req, res) => {
       template: {
         id: template._id,
         name: template.name,
-        frontSideUrl: template.frontSide.secure_url
+        frontSideUrl: template.frontSide.secure_url || template.frontSide.url
       }
     });
 
@@ -432,45 +456,272 @@ router.get('/template-dimensions/:templateId', async (req, res) => {
   }
 });
 
-// ========== UPDATED HELPER FUNCTIONS FOR CLOUDINARY ==========
-
-// ✅ GENERATE CARDS WITH CLOUDINARY TEMPLATES
-async function generateCardsWithCloudinary(student, template, coordinates, photoFileOrPath) {
+// ✅ 9. STUDENT PHOTO UPLOAD (Individual photo upload)
+router.post('/upload-student-photo', upload.single('photo'), async (req, res) => {
   try {
-    console.log('🎨 Generating card with Cloudinary templates...');
+    const { studentId } = req.body;
+    
+    if (!studentId || !req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'Student ID and photo are required'
+      });
+    }
 
-    // Load template image from Cloudinary URL
+    const student = await Student.findById(studentId);
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        error: 'Student not found'
+      });
+    }
+
+    console.log(`📸 Uploading photo for ${student.name}...`);
+
+    // Upload to Cloudinary
+    const uploadResult = await cloudinary.uploader.upload(
+      `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`,
+      {
+        folder: 'student-cards/student-photos',
+        public_id: `student-${student.student_id}-${Date.now()}`,
+        overwrite: true,
+        transformation: [
+          { width: 500, height: 500, crop: "fill" },
+          { quality: "auto:good" }
+        ]
+      }
+    );
+
+    // Update student record
+    student.photo_url = uploadResult.secure_url;
+    student.photo_public_id = uploadResult.public_id;
+    student.photo_metadata = {
+      width: uploadResult.width,
+      height: uploadResult.height,
+      format: uploadResult.format,
+      bytes: uploadResult.bytes
+    };
+    student.has_photo = true;
+    student.photo_uploaded_at = new Date();
+    
+    await student.save();
+
+    console.log(`✅ Photo uploaded for ${student.name}`);
+
+    res.json({
+      success: true,
+      message: 'Photo uploaded successfully',
+      photo_url: uploadResult.secure_url,
+      student: {
+        id: student._id,
+        name: student.name,
+        has_photo: true
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Photo upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+
+// ==================== HELPER FUNCTIONS ====================
+
+// ✅ PARSE CSV FROM BUFFER
+async function parseCSVFromBuffer(csvBuffer) {
+  return new Promise((resolve, reject) => {
+    try {
+      const students = [];
+      const csvString = csvBuffer.toString('utf-8');
+      const lines = csvString.split('\n').filter(line => line.trim());
+      
+      if (lines.length === 0) {
+        return resolve([]);
+      }
+
+      // Auto-detect headers (support with/without headers)
+      const firstLine = lines[0].toLowerCase();
+      let startIndex = 0;
+      
+      if (firstLine.includes('student_id') || firstLine.includes('name')) {
+        // Has headers, skip first line
+        startIndex = 1;
+      }
+
+      for (let i = startIndex; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        // Simple CSV parsing (supports quoted fields)
+        const values = parseCSVLine(line);
+        
+        // Map values to student object
+        const student = {
+          student_id: values[0] || `STU${i.toString().padStart(3, '0')}`,
+          name: values[1] || 'Unknown Student',
+          class: values[2] || 'N/A',
+          level: values[3] || 'N/A',
+          residence: values[4] || 'N/A',
+          gender: values[5] || 'N/A',
+          academic_year: values[6] || '2024',
+          parent_phone: values[7] || ''
+        };
+
+        students.push(student);
+      }
+
+      resolve(students);
+    } catch (error) {
+      reject(new Error(`CSV parsing failed: ${error.message}`));
+    }
+  });
+}
+
+// ✅ SIMPLE CSV LINE PARSER
+function parseCSVLine(line) {
+  const values = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const nextChar = line[i + 1];
+
+    if (char === '"' && inQuotes && nextChar === '"') {
+      // Escaped quote
+      current += '"';
+      i++; // Skip next char
+    } else if (char === '"') {
+      // Quote
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      // Comma outside quotes = field delimiter
+      values.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  // Add last field
+  values.push(current.trim());
+  return values;
+}
+
+// ✅ EXTRACT AND UPLOAD PHOTOS TO CLOUDINARY
+async function extractAndUploadPhotosToCloudinary(zipBuffer) {
+  const photoCloudinaryMap = {};
+  
+  try {
+    const zip = new JSZip();
+    const zipData = await zip.loadAsync(zipBuffer);
+    
+    const filePromises = [];
+    
+    // Process each file in ZIP
+    for (const [fileName, file] of Object.entries(zipData.files)) {
+      if (!file.dir && fileName.match(/\.(jpg|jpeg|png|gif|bmp)$/i)) {
+        filePromises.push(processPhotoFile(fileName, file, photoCloudinaryMap));
+      }
+    }
+    
+    // Wait for all photos to be processed
+    await Promise.all(filePromises);
+    
+    return photoCloudinaryMap;
+    
+  } catch (error) {
+    console.error('❌ ZIP processing error:', error);
+    return {};
+  }
+}
+
+// ✅ PROCESS INDIVIDUAL PHOTO FILE
+async function processPhotoFile(fileName, file, photoCloudinaryMap) {
+  try {
+    // Extract student ID from filename (e.g., "STU001.jpg" → "STU001")
+    const studentId = path.parse(fileName).name;
+    
+    // Skip if not a valid student ID format
+    if (!studentId || studentId.length < 2) {
+      console.warn(`⚠️ Skipping invalid filename: ${fileName}`);
+      return;
+    }
+
+    // Read file as buffer
+    const fileBuffer = await file.async('nodebuffer');
+    
+    if (fileBuffer.length === 0) {
+      console.warn(`⚠️ Empty photo file: ${fileName}`);
+      return;
+    }
+
+    console.log(`📸 Processing photo for ${studentId}: ${fileName} (${(fileBuffer.length / 1024).toFixed(2)} KB)`);
+
+    // Upload to Cloudinary
+    const uploadResult = await cloudinary.uploader.upload(
+      `data:image/jpeg;base64,${fileBuffer.toString('base64')}`,
+      {
+        folder: 'student-cards/student-photos',
+        public_id: `student-${studentId}-${Date.now()}`,
+        overwrite: true,
+        transformation: [
+          { width: 500, height: 500, crop: "fill" }, // Resize for ID cards
+          { quality: "auto:good" }
+        ]
+      }
+    );
+
+    // Store Cloudinary data
+    photoCloudinaryMap[studentId] = {
+      secure_url: uploadResult.secure_url,
+      public_id: uploadResult.public_id,
+      width: uploadResult.width,
+      height: uploadResult.height,
+      format: uploadResult.format,
+      bytes: uploadResult.bytes
+    };
+
+    console.log(`✅ Uploaded to Cloudinary: ${studentId} → ${uploadResult.public_id}`);
+    
+  } catch (error) {
+    console.error(`❌ Failed to process photo ${fileName}:`, error.message);
+  }
+}
+
+// ✅ GENERATE CARDS WITH CLOUDINARY (updated to use URLs)
+async function generateCardsWithCloudinary(student, template, coordinates, studentPhotoUrl) {
+  try {
+    console.log(`🎨 Generating card for ${student.name} ${studentPhotoUrl ? '(with photo)' : '(no photo)'}`);
+
+    // Load template from Cloudinary
     const templateImage = await loadImage(template.frontSide.secure_url);
     const templateWidth = templateImage.width;
     const templateHeight = templateImage.height;
 
-    // Create canvas with exact template dimensions
+    // Create canvas
     const canvas = createCanvas(templateWidth, templateHeight);
     const ctx = canvas.getContext('2d');
 
-    // Draw template background
+    // Draw template
     ctx.drawImage(templateImage, 0, 0, templateWidth, templateHeight);
 
-    // Handle student photo (could be Cloudinary URL, local path, or file object)
-    let photoPath = null;
-    if (photoFileOrPath) {
-      if (typeof photoFileOrPath === 'object' && photoFileOrPath.path) {
-        // Local file object (from temporary ZIP extraction)
-        photoPath = photoFileOrPath.path;
-      } else if (typeof photoFileOrPath === 'string') {
-        // Could be Cloudinary URL or local path
-        photoPath = photoFileOrPath;
-      }
-    }
-
-    // ✅ ADD STUDENT PHOTO
-    if (photoPath && coordinates.photo) {
+    // ✅ ADD STUDENT PHOTO FROM CLOUDINARY URL
+    if (studentPhotoUrl && coordinates.photo) {
       try {
-        const studentPhoto = await loadImage(photoPath);
+        const studentPhoto = await loadImage(studentPhotoUrl);
         const { x, y, width, height } = coordinates.photo;
         const borderRadius = 8;
 
-        // Draw white border
+        // Draw border
         ctx.save();
         ctx.beginPath();
         ctx.roundRect(x - 2, y - 2, width + 4, height + 4, borderRadius + 4);
@@ -486,113 +737,50 @@ async function generateCardsWithCloudinary(student, template, coordinates, photo
         ctx.drawImage(studentPhoto, x, y, width, height);
         ctx.restore();
 
-        console.log('✅ Student photo added');
+        console.log(`✅ Added Cloudinary photo for ${student.name}`);
       } catch (photoError) {
-        console.warn('⚠️ Could not add student photo:', photoError.message);
-        // Draw placeholder
-        ctx.save();
-        ctx.beginPath();
-        ctx.roundRect(coordinates.photo.x, coordinates.photo.y, 
-                     coordinates.photo.width, coordinates.photo.height, 8);
-        ctx.fillStyle = 'rgba(16, 185, 129, 0.5)';
-        ctx.fill();
-        ctx.restore();
+        console.warn(`⚠️ Could not load Cloudinary photo for ${student.name}:`, photoError.message);
+        drawPhotoPlaceholder(ctx, coordinates.photo);
       }
     } else if (coordinates.photo) {
-      // No photo available - draw placeholder
-      ctx.save();
-      ctx.beginPath();
-      ctx.roundRect(coordinates.photo.x, coordinates.photo.y, 
-                   coordinates.photo.width, coordinates.photo.height, 8);
-      ctx.fillStyle = 'rgba(16, 185, 129, 0.5)';
-      ctx.fill();
-      ctx.restore();
+      drawPhotoPlaceholder(ctx, coordinates.photo);
     }
 
-    // ✅ IMPROVED TEXT RENDERING
-    const getFontStyle = (field, templateWidth) => {
-      let baseSize;
-      if (templateWidth >= 1000) {
-        baseSize = 28;
-      } else if (templateWidth >= 800) {
-        baseSize = 20;
-      } else {
-        baseSize = 16;
-      }
-
-      const sizes = {
-        name: baseSize + 4,
-        class: baseSize,
-        level: baseSize,
-        residence: baseSize,
-        gender: baseSize,
-        academic_year: baseSize
-      };
-
-      const weights = {
-        name: 'bold',
-        class: 'normal',
-        level: 'normal',
-        residence: 'normal',
-        gender: 'normal',
-        academic_year: 'normal'
-      };
-
-      const size = sizes[field] || baseSize;
-      const weight = weights[field] || 'normal';
-
-      return `${weight} ${size}px "Roboto", "Open Sans", Arial, sans-serif`;
-    };
-
-    // Set text style
+    // ✅ ADD TEXT FIELDS
     ctx.fillStyle = '#000000';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
 
-    // ✅ ADD ALL TEXT FIELDS
-    const addText = (text, coord, field) => {
-      if (!text || text === 'N/A' || !coord || coord.x === undefined || coord.y === undefined) {
-        return;
-      }
-
-      const textToPrint = text.toString().trim();
-      if (textToPrint) {
-        try {
-          ctx.font = getFontStyle(field, templateWidth);
-
-          // Handle text overflow
-          let displayText = textToPrint;
-          if (coord.maxWidth) {
-            const metrics = ctx.measureText(textToPrint);
-            if (metrics.width > coord.maxWidth) {
-              let truncated = textToPrint;
-              while (ctx.measureText(truncated + '...').width > coord.maxWidth && truncated.length > 1) {
-                truncated = truncated.slice(0, -1);
-              }
-              displayText = truncated + '...';
-            }
-          }
-
-          ctx.fillText(displayText, coord.x, coord.y);
-          console.log(`✅ Added ${field}: "${displayText}" at (${coord.x}, ${coord.y})`);
-        } catch (textError) {
-          console.warn(`⚠️ Could not add text for ${field}:`, textError.message);
+    // Add text helper
+    const addText = (text, coord, fontSize = 20, isBold = false) => {
+      if (!text || !coord) return;
+      
+      ctx.font = `${isBold ? 'bold' : 'normal'} ${fontSize}px "Roboto", Arial, sans-serif`;
+      
+      // Truncate if too long
+      let displayText = text.toString();
+      if (coord.maxWidth) {
+        while (ctx.measureText(displayText).width > coord.maxWidth && displayText.length > 3) {
+          displayText = displayText.slice(0, -1);
         }
+        if (displayText !== text) displayText += '...';
       }
+      
+      ctx.fillText(displayText, coord.x, coord.y);
     };
 
     // Add all student data
-    addText(student.name, coordinates.name, 'name');
-    addText(student.class, coordinates.class, 'class');
-    addText(student.level, coordinates.level, 'level');
-    addText(student.residence, coordinates.residence, 'residence');
-    addText(student.gender, coordinates.gender, 'gender');
-    addText(student.academic_year, coordinates.academic_year, 'academic_year');
+    addText(student.name, coordinates.name, 28, true);
+    addText(student.class, coordinates.class, 20);
+    addText(student.level, coordinates.level, 20);
+    addText(student.gender, coordinates.gender, 18);
+    addText(student.residence, coordinates.residence, 18);
+    addText(student.academic_year, coordinates.academic_year, 18);
 
     // Generate front buffer
     const frontBuffer = canvas.toBuffer('image/png');
 
-    // Handle back side (load from Cloudinary)
+    // Generate back buffer
     let backBuffer;
     try {
       if (template.backSide && template.backSide.secure_url) {
@@ -602,7 +790,6 @@ async function generateCardsWithCloudinary(student, template, coordinates, photo
         backCtx.drawImage(backTemplate, 0, 0);
         backBuffer = backCanvas.toBuffer('image/png');
       } else {
-        // No back side - create empty
         const backCanvas = createCanvas(templateWidth, templateHeight);
         const backCtx = backCanvas.getContext('2d');
         backCtx.fillStyle = '#FFFFFF';
@@ -610,84 +797,40 @@ async function generateCardsWithCloudinary(student, template, coordinates, photo
         backBuffer = backCanvas.toBuffer('image/png');
       }
     } catch (backError) {
-      console.warn('⚠️ Could not generate back side:', backError.message);
-      // Create empty back buffer
       const backCanvas = createCanvas(templateWidth, templateHeight);
       backBuffer = backCanvas.toBuffer('image/png');
     }
 
-    console.log('✅ Canvas generation completed with Cloudinary');
+    console.log(`✅ Card generation completed for ${student.name}`);
     return { frontBuffer, backBuffer };
 
   } catch (error) {
-    console.error('❌ Canvas generation failed:', error);
-    throw new Error(`Card generation failed: ${error.message}`);
-  }
-}
-
-// ✅ Helper function to load image from URL (with retry)
-async function loadImageFromUrl(url) {
-  try {
-    return await loadImage(url);
-  } catch (error) {
-    console.warn(`⚠️ Failed to load image from URL, retrying...: ${url}`);
-    
-    // For Cloudinary URLs, try adding optimization parameters
-    if (url.includes('cloudinary.com')) {
-      const optimizedUrl = url.replace(/\/upload\//, '/upload/q_auto,f_auto/');
-      return await loadImage(optimizedUrl);
-    }
-    
+    console.error(`❌ Card generation failed for ${student.name}:`, error);
     throw error;
   }
 }
 
-// ========== EXISTING HELPER FUNCTIONS (unchanged) ==========
-
-async function parseCSV(csvPath) {
-  return new Promise((resolve, reject) => {
-    const students = [];
-    fs.createReadStream(csvPath)
-      .pipe(csv())
-      .on('data', (row) => {
-        students.push({
-          student_id: row.student_id,
-          name: row.name,
-          class: row.class || 'N/A',
-          level: row.level || 'N/A',
-          residence: row.residence || 'N/A',
-          gender: row.gender || 'N/A',
-          academic_year: row.academic_year || 'N/A',
-          parent_phone: row.parent_phone || ''
-        });
-      })
-      .on('end', () => resolve(students))
-      .on('error', reject);
-  });
+// ✅ PHOTO PLACEHOLDER
+function drawPhotoPlaceholder(ctx, photoCoords) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(photoCoords.x, photoCoords.y, 
+               photoCoords.width, photoCoords.height, 8);
+  ctx.fillStyle = 'rgba(16, 185, 129, 0.3)';
+  ctx.fill();
+  
+  // Draw camera icon
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 24px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('📷', 
+    photoCoords.x + photoCoords.width / 2, 
+    photoCoords.y + photoCoords.height / 2);
+  ctx.restore();
 }
 
-async function extractPhotos(zipPath) {
-  const photoMap = {};
-  const extractPath = 'uploads/photos/extracted/' + Date.now();
-
-  await fs.promises.mkdir(extractPath, { recursive: true });
-
-  await new Promise((resolve, reject) => {
-    fs.createReadStream(zipPath)
-      .pipe(unzipper.Extract({ path: extractPath }))
-      .on('close', resolve)
-      .on('error', reject);
-  });
-
-  const files = await fs.promises.readdir(extractPath);
-  for (const file of files) {
-    const studentId = path.parse(file).name;
-    photoMap[studentId] = path.join(extractPath, file);
-  }
-
-  return photoMap;
-}
-
+// Make sure to include createZipInMemory:
 async function createZipInMemory(files) {
   return new Promise((resolve, reject) => {
     const archive = archiver('zip', { zlib: { level: 9 } });
@@ -705,12 +848,22 @@ async function createZipInMemory(files) {
   });
 }
 
-function cleanupFiles(filePaths) {
-  filePaths.forEach(filePath => {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
+// Make sure to include loadImageFromUrl for error handling:
+async function loadImageFromUrl(url) {
+  try {
+    return await loadImage(url);
+  } catch (error) {
+    console.warn(`⚠️ Failed to load image, retrying: ${url}`);
+    
+    // For Cloudinary URLs, try adding optimization parameters
+    if (url.includes('cloudinary.com')) {
+      const optimizedUrl = url.replace(/\/upload\//, '/upload/q_auto,f_auto/');
+      return await loadImage(optimizedUrl);
     }
-  });
+    
+    throw error;
+  }
 }
+
 
 module.exports = router;
