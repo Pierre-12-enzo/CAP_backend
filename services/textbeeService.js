@@ -115,21 +115,21 @@ class TextBeeService {
 
   // School-specific SMS templates
   async sendPermissionCreated(student, permission, parentPhone) {
-    const message = `URUHUSHYA RW'UMWANA 📚\n\n` +
-                   `Mwituye ${student.name}\n` +
-                   `Isomo: ${student.class}\n` +
-                   `Impamvu: ${permission.reason}\n` +
-                   `Aho agenda: ${permission.destination}\n` +
-                   `Itariki yo gusubira: ${new Date(permission.returnDate).toLocaleDateString('rw-RW')}\n` +
+    const message = `Mwiriwe Neza Umwana Wanyu: 📚\n\n` +
+                   `Witwa ${student.name}\n` +
+                   `Wiga: ${student.class}\n` +
+                   `Atashye Kubera Impamvu Ikurikira: ${permission.reason}\n` +
+                   `Akaba Atashye i: ${permission.destination}\n` +
+                   `Itariki yo kugaruka: ${new Date(permission.returnDate).toLocaleDateString('rw-RW')}\n` +
                    `Numero y'uruhushya: ${permission.permissionNumber}\n\n` +
-                   `Mwihangane, murakoze.`;
+                   `Ku Bindi Bisobanuro Mwavugisha DOD W'ikigo,  Murakoze.`;
     
     return this.sendSMS(parentPhone, message);
   }
 
   async sendReturnConfirmation(student, permission, parentPhone) {
-    const message = `UMWANA WASUBIYE ✅\n\n` +
-                   `Mwituye ${student.name}\n` +
+    const message = `MWIRIWE NEZA ✅\n\n` +
+                   `Umwana Wanyu Witwa ${student.name}\n` +
                    `Yasubiye mu ishuri neza.\n` +
                    `Numero y'uruhushya: ${permission.permissionNumber}\n` +
                    `Itariki: ${new Date().toLocaleDateString('rw-RW')}\n\n` +
